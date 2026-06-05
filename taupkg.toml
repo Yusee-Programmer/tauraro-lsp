@@ -1,0 +1,8 @@
+[package]
+name    = "tauraro-lsp"
+version = "0.1.0"
+desc    = "Language Server Protocol implementation for Tauraro"
+license = "MIT"
+bin     = "src/main.tr"
+
+[deps]

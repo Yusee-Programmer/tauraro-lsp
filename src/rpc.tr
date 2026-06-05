@@ -1,0 +1,86 @@
+# rpc.tr — JSON-RPC 2.0 transport over stdio with Content-Length framing.
+#
+# All I/O is done via runtime functions declared in tauraro_rt.h so the
+# LSP server is 100% Tauraro — no hand-written C shim files needed.
+
+from json import JsonVal, json_parse, json_str, JObjBuilder
+from json import jstr, jint, jv_get, jv_str, jv_is_null
+
+# ── Runtime I/O primitives (implemented in tauraro_rt.h) ─────────────────────
+extern "C":
+    # Read one raw line from stdin (including \r\n; "" = EOF).
+    def _tr_read_stdin_line() -> str
+    # Read exactly n bytes from stdin ("" = EOF).
+    def _tr_read_stdin_bytes(n: int) -> str
+    # Write s to stdout without a trailing newline.
+    def _tr_write_stdout(s: str)
+    # Flush stdout so the peer receives the message immediately.
+    def _tr_flush_stdout()
+    # 1 if stdin is an interactive terminal, 0 if a pipe.
+    def _tr_stdin_isatty() -> int
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+pub def rpc_is_terminal() -> bool:
+    return _tr_stdin_isatty() != 0
+
+# Read one complete LSP message from stdin.
+# Returns JNull on EOF or protocol error.
+pub def rpc_read() -> JsonVal:
+    mut content_length = -1
+    while true:
+        mut line = _tr_read_stdin_line()
+        # _tr_read_stdin_line returns "" only on true EOF (fgets returned NULL).
+        # A blank header-separator line is "\r\n" or "\n" — non-empty before trim.
+        if line.len() == 0:
+            return JsonVal.JNull  # real EOF
+        mut trimmed = line.trim()
+        if trimmed.len() == 0:
+            break  # blank separator line → body follows
+        if trimmed.starts_with("Content-Length:"):
+            mut val_s = trimmed.slice(15, trimmed.len()).trim()
+            content_length = val_s.parse_int()
+    if content_length <= 0:
+        return JsonVal.JNull
+    mut body = _tr_read_stdin_bytes(content_length)
+    if body.len() == 0:
+        return JsonVal.JNull
+    return json_parse(body)
+
+# Write one LSP message to stdout with Content-Length framing.
+pub def rpc_write(v: JsonVal):
+    mut body = json_str(v)
+    mut msg  = "Content-Length: " + body.len().to_str() + "\r\n\r\n" + body
+    _tr_write_stdout(msg)
+    _tr_flush_stdout()
+
+
+# ── Response builders ─────────────────────────────────────────────────────────
+
+pub def rpc_response(id: JsonVal, result: JsonVal) -> JsonVal:
+    mut b = JObjBuilder.init()
+    b.add("jsonrpc", jstr("2.0"))
+    b.add("id",      id)
+    b.add("result",  result)
+    return b.build()
+
+pub def rpc_error(id: JsonVal, code: int, message: str) -> JsonVal:
+    mut err = JObjBuilder.init()
+    err.add("code",    jint(code))
+    err.add("message", jstr(message))
+    mut b = JObjBuilder.init()
+    b.add("jsonrpc", jstr("2.0"))
+    b.add("id",      id)
+    b.add("error",   err.build())
+    return b.build()
+
+pub def rpc_notify(method: str, params: JsonVal) -> JsonVal:
+    mut b = JObjBuilder.init()
+    b.add("jsonrpc", jstr("2.0"))
+    b.add("method",  jstr(method))
+    b.add("params",  params)
+    return b.build()
+
+pub def LSP_ERR_METHOD_NOT_FOUND() -> int:  return -32601
+pub def LSP_ERR_SERVER_NOT_INIT() -> int:   return -32002

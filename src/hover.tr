@@ -1,0 +1,151 @@
+# hover.tr — Hover provider.
+# Returns type info, doc comments, and error-code explanations on hover.
+
+from document import TextDocument
+from protocol import lsp_hover
+from json import JsonVal, jnull
+
+pub def provide_hover(doc: TextDocument, line: int, character: int) -> JsonVal:
+    mut word = doc.word_at(line, character)
+    if word.len() == 0: return jnull()
+
+    # Check for error code hover (e.g. hovering over [M-1] in a comment)
+    mut line_text = doc.get_line(line)
+    mut code_hover = _error_code_at(line_text, character)
+    if code_hover.len() > 0:
+        return lsp_hover(code_hover, line, character, line, character + word.len())
+
+    # Built-in type hover
+    mut type_info = _builtin_type_info(word)
+    if type_info.len() > 0:
+        return lsp_hover(type_info, line, character, line, character + word.len())
+
+    # Keyword hover
+    mut kw_info = _keyword_info(word)
+    if kw_info.len() > 0:
+        return lsp_hover(kw_info, line, character, line, character + word.len())
+
+    # Search backwards for the declaration of this word
+    mut decl_info = _find_decl(doc, word, line)
+    if decl_info.len() > 0:
+        return lsp_hover(decl_info, line, character, line, character + word.len())
+
+    return jnull()
+
+
+def _error_code_at(line: str, character: int) -> str:
+    # Check if cursor is inside or near [X-N]
+    mut search = line
+    mut i = 0
+    while i < search.len():
+        if search.char_at(i) == 91:  # '['
+            mut j = i + 1
+            while j < search.len() and search.char_at(j) != 93 and j - i < 8:
+                j = j + 1
+            if j < search.len() and search.char_at(j) == 93:
+                if character >= i and character <= j:
+                    mut code = search.slice(i + 1, j)
+                    return _error_code_doc(code)
+        i = i + 1
+    return ""
+
+def _error_code_doc(code: str) -> str:
+    if code == "M-1": return "**[M-1] Use after move**\n\nA value was used after it was moved. Moves transfer ownership; the original variable is no longer valid.\n\n**Fix:** Copy the value before moving, or don't move it."
+    if code == "M-2": return "**[M-2] Double move**\n\nA value was moved more than once.\n\n**Fix:** Clone or restructure the code to avoid the second move."
+    if code == "M-4": return "**[M-4] Mutation while borrowed**\n\nA container was mutated while a borrow into it was live.\n\n**Fix:** Finish using the borrowed value before mutating the container."
+    if code == "F-3": return "**[F-3] Missing return**\n\nNot all code paths in a non-void function return a value.\n\n**Fix:** Add a `return` at the end, or ensure every branch returns."
+    if code == "N-1": return "**[N-1] Reserved name**\n\nA built-in name was used as a variable/function name.\n\n**Fix:** Rename the identifier."
+    if code == "T-1": return "**[T-1] Non-Sendable type in spawn**\n\nA type crossing a thread boundary does not implement `Sendable`.\n\n**Fix:** Wrap in `Mutex[T]` or add `implements Sendable`."
+    if code == "L-1": return "**[L-1] Escaping local pointer**\n\nA local `Pointer[T]` is being returned without a lifetime annotation.\n\n**Fix:** Annotate the return type with `from <param>`, or use `unsafe:` if heap-allocated."
+    if code == "E-1": return "**[E-1] Explicit main() call**\n\nCalling `main()` explicitly is forbidden; the compiler invokes it automatically."
+    if code == "U-1": return "**[U-1] Unsafe in strict mode**\n\n`unsafe:` blocks are not allowed when compiling with `--strict`."
+    return "**[" + code + "]** Tauraro compiler diagnostic"
+
+def _builtin_type_info(word: str) -> str:
+    if word == "int":   return "**int** — 64-bit signed integer (`long long` in C)"
+    if word == "float": return "**float** — 64-bit floating point (`double` in C)"
+    if word == "str":   return "**str** — Immutable C string (`char*`). Use `StringBuilder` for building strings."
+    if word == "bool":  return "**bool** — Boolean value: `true` or `false`"
+    if word == "char":  return "**char** — Single ASCII character (8-bit)"
+    if word == "u64":   return "**u64** — 64-bit unsigned integer"
+    if word == "u32":   return "**u32** — 32-bit unsigned integer"
+    if word == "i32":   return "**i32** — 32-bit signed integer"
+    if word == "i8":    return "**i8** — 8-bit signed integer"
+    if word == "void":  return "**void** — No value (unit type)"
+    if word == "Vec":   return "**Vec[T]** — Growable array.\n\n```tauraro\nmut v = Vec[int].init(8)\nv.push(42)\nprint(v.get(0))\n```"
+    if word == "Map":   return "**Map[K, V]** — Hash map.\n\n```tauraro\nmut m = Map[str, int].init(16)\nm.insert(\"a\", 1)\nprint(m.get(\"a\"))\n```"
+    if word == "Pointer": return "**Pointer[T]** — Raw pointer to T. Use in `unsafe:` blocks for low-level operations."
+    if word == "Option": return "**Option[T]** — Optional value: `Option.some(val)` or `Option.none()`"
+    if word == "Result": return "**Result[T, E]** — Error-handling type: `Result.ok(val)` or `Result.err(err)`"
+    if word == "Shared": return "**Shared[T]** — Reference-counted shared ownership. Cloned via `clone()`, freed automatically."
+    if word == "Mutex":  return "**Mutex[T]** — Thread-safe value container. Use `.lock()` / `.get()` to access."
+    if word == "Chan":   return "**Chan[T]** — Synchronous channel for goroutine-style communication."
+    if word == "Atomic": return "**Atomic[T]** — Lock-free atomic integer operations."
+    if word == "StringBuilder": return "**StringBuilder** — Efficient string building.\n\n```tauraro\nmut sb = StringBuilder.init(64)\nsb.append(\"Hello \")\nsb.append(\"World\")\nmut s = sb.to_string()\n```"
+    return ""
+
+def _keyword_info(word: str) -> str:
+    if word == "def":   return "**def** — Define a function.\n\n```tauraro\ndef add(a: int, b: int) -> int:\n    return a + b\n```"
+    if word == "pub":   return "**pub** — Mark a function, class, or field as public (visible outside the module)."
+    if word == "mut":   return "**mut** — Declare a mutable variable or function parameter.\n\n```tauraro\nmut x = 5\nx = x + 1\n```"
+    if word == "class": return "**class** — Define a class (reference type, heap-allocated).\n\n```tauraro\nclass Point:\n    pub x: float\n    pub y: float\n```"
+    if word == "extend": return "**extend** — Add methods to a class or enum outside its definition.\n\n```tauraro\nextend Point:\n    pub def dist(self) -> float:\n        return (self.x * self.x + self.y * self.y).sqrt()\n```"
+    if word == "enum":  return "**enum** — Define a sum type (tagged union).\n\n```tauraro\nenum Shape:\n    Circle(radius: float)\n    Rect(w: float, h: float)\n```"
+    if word == "match": return "**match** — Pattern matching on an enum value.\n\n```tauraro\nmatch shape:\n    case Shape.Circle(r): print(r)\n    case Shape.Rect(w, h): print(w * h)\n```"
+    if word == "unsafe": return "**unsafe:** — Opt-in to unsafe operations (raw pointer arithmetic, etc.).\n\n```tauraro\nunsafe:\n    mut p = value as Pointer[char]\n    p.offset(0).write(65 as char)\n```"
+    if word == "spawn": return "**spawn** — Launch a concurrent task.\n\n```tauraro\nspawn my_function(arg)\n```"
+    if word == "await": return "**await** — Wait for an async task to complete."
+    if word == "from":  return "**from** — Import specific symbols from a module.\n\n```tauraro\nfrom std.io import File\nfrom mymod import MyClass, my_fn\n```"
+    if word == "extern": return "**extern \"C\"** — Declare an external C function.\n\n```tauraro\nextern \"C\":\n    def my_c_fn(x: int) -> int\n```"
+    if word == "true":  return "**true** — Boolean literal `true`"
+    if word == "false": return "**false** — Boolean literal `false`"
+    if word == "none":  return "**none** — Null literal for `Option[T]` types"
+    return ""
+
+def _find_decl(doc: TextDocument, word: str, from_line: int) -> str:
+    # Search backwards for "def word" or "mut word" or "word: type"
+    mut i = from_line
+    while i >= 0 and i > from_line - 50:
+        mut line = doc.get_line(i).trim()
+
+        # def name(...) -> RetType:
+        if line.starts_with("def " + word + "(") or line.starts_with("pub def " + word + "("):
+            mut ret = _extract_ret(line)
+            mut params = _extract_params(line)
+            mut header = "```tauraro\n" + line.replace("pub ", "")
+            if ret.len() > 0:
+                return "**function** `" + word + "`\n\n" + header + "\n```"
+            return "**function** `" + word + "`\n\n```tauraro\n" + line + "\n```"
+
+        # class/enum Name:
+        if line.starts_with("class " + word) or line.starts_with("pub class " + word):
+            return "**class** `" + word + "`\n\nUser-defined class (heap-allocated reference type)."
+        if line.starts_with("enum " + word) or line.starts_with("pub enum " + word):
+            return "**enum** `" + word + "`\n\nUser-defined enum (tagged union / sum type)."
+
+        # mut name: Type = ...  or  mut name = ...
+        if line.starts_with("mut " + word + ":") or line.starts_with("mut " + word + " ="):
+            mut after = line.slice(4 + word.len(), line.len()).trim()
+            if after.starts_with(":"):
+                mut type_str = after.slice(1, after.len()).trim()
+                mut eq = type_str.index_of("=")
+                if eq >= 0: type_str = type_str.slice(0, eq).trim()
+                return "**variable** `" + word + ": " + type_str + "`"
+            return "**variable** `" + word + "`"
+
+        i = i - 1
+    return ""
+
+def _extract_ret(line: str) -> str:
+    mut arrow = line.index_of("->")
+    if arrow < 0: return ""
+    mut rest = line.slice(arrow + 2, line.len()).trim()
+    mut colon = rest.index_of(":")
+    if colon >= 0: rest = rest.slice(0, colon).trim()
+    return rest
+
+def _extract_params(line: str) -> str:
+    mut open = line.index_of("(")
+    mut close = line.index_of(")")
+    if open < 0 or close < 0: return ""
+    return line.slice(open + 1, close)

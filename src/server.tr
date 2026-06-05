@@ -1,0 +1,233 @@
+# server.tr — LSP request/notification dispatcher.
+
+from std.io import File
+from std.os import OS
+from json import JsonVal, JObjBuilder, JArrBuilder, jstr, jint, jbool, jnull
+from json import jv_get, jv_get_path, jv_str, jv_int, jv_bool, jv_is_null
+from json import jv_arr_len, jv_arr_get
+from rpc import rpc_write, rpc_response, rpc_error, rpc_notify
+from rpc import LSP_ERR_METHOD_NOT_FOUND, LSP_ERR_SERVER_NOT_INIT
+from document import DocumentStore, uri_to_path
+from analyzer import Analyzer, AnalysisResult, _find_compiler
+from protocol import lsp_publish_diagnostics, lsp_diagnostic, pos_line, pos_char
+from completion import provide_completions
+from hover import provide_hover
+from definition import provide_definition
+from symbols import provide_document_symbols, provide_workspace_symbols
+from semantic_tokens import provide_semantic_tokens
+
+pub class LspServer:
+    pub store:        DocumentStore
+    pub analyzer:    Analyzer
+    pub initialized: bool
+    pub shutdown:    bool
+    pub log_file:    str
+
+extend LspServer:
+    pub def init() -> LspServer:
+        mut s = LspServer()
+        s.store       = DocumentStore.init()
+        s.analyzer    = Analyzer.init(_find_compiler())
+        s.initialized = false
+        s.shutdown    = false
+        s.log_file    = ""
+        return s
+
+    pub def handle(self, msg: JsonVal) -> bool:
+        if jv_is_null(msg): return false
+
+        mut method = jv_str(jv_get(msg, "method"))
+        mut id     = jv_get(msg, "id")
+        mut params = jv_get(msg, "params")
+
+        self.log("-> " + method)
+
+        if method == "initialize":        return self.on_initialize(id, params)
+        if method == "initialized":       self.initialized = true; return true
+        if method == "shutdown":          self.shutdown = true; rpc_write(rpc_response(id, jnull())); return true
+        if method == "exit":              return false
+        if method == "$/cancelRequest":   return true
+        if method == "$/setTrace":        return true
+
+        if not self.initialized:
+            rpc_write(rpc_error(id, LSP_ERR_SERVER_NOT_INIT(), "Server not initialized"))
+            return true
+
+        if method == "textDocument/didOpen":    return self.on_did_open(params)
+        if method == "textDocument/didChange":  return self.on_did_change(params)
+        if method == "textDocument/didClose":   return self.on_did_close(params)
+        if method == "textDocument/didSave":    return self.on_did_save(params)
+        if method == "textDocument/hover":              return self.on_hover(id, params)
+        if method == "textDocument/completion":         return self.on_completion(id, params)
+        if method == "textDocument/definition":         return self.on_definition(id, params)
+        if method == "textDocument/documentSymbol":     return self.on_document_symbols(id, params)
+        if method == "workspace/symbol":                return self.on_workspace_symbols(id, params)
+        if method == "textDocument/semanticTokens/full": return self.on_semantic_tokens(id, params)
+
+        if not jv_is_null(id):
+            rpc_write(rpc_error(id, LSP_ERR_METHOD_NOT_FOUND(), "Method not found: " + method))
+        return true
+
+    # ── Initialize ─────────────────────────────────────────────────────────────
+
+    def on_initialize(self, id: JsonVal, params: JsonVal) -> bool:
+        mut trigger_chars = JArrBuilder.init()
+        trigger_chars.add(jstr("."))
+        trigger_chars.add(jstr("("))
+
+        mut completion_provider = JObjBuilder.init()
+        completion_provider.add("triggerCharacters", trigger_chars.build())
+        completion_provider.add("resolveProvider", jbool(false))
+
+        mut sem_legend = _semantic_tokens_legend()
+        mut sem_provider = JObjBuilder.init()
+        sem_provider.add("legend", sem_legend)
+        sem_provider.add("full", jbool(true))
+
+        mut capabilities = JObjBuilder.init()
+        capabilities.add("textDocumentSync",       jint(1))
+        capabilities.add("hoverProvider",          jbool(true))
+        capabilities.add("completionProvider",     completion_provider.build())
+        capabilities.add("definitionProvider",     jbool(true))
+        capabilities.add("documentSymbolProvider", jbool(true))
+        capabilities.add("workspaceSymbolProvider", jbool(true))
+        capabilities.add("semanticTokensProvider", sem_provider.build())
+
+        mut server_info = JObjBuilder.init()
+        server_info.add("name",    jstr("tauraro-lsp"))
+        server_info.add("version", jstr("0.1.0"))
+
+        mut result = JObjBuilder.init()
+        result.add("capabilities", capabilities.build())
+        result.add("serverInfo",   server_info.build())
+
+        rpc_write(rpc_response(id, result.build()))
+        self.initialized = true
+        return true
+
+    # ── Document sync ──────────────────────────────────────────────────────────
+
+    def on_did_open(self, params: JsonVal) -> bool:
+        mut td      = jv_get(params, "textDocument")
+        mut uri     = jv_str(jv_get(td, "uri"))
+        mut lang    = jv_str(jv_get(td, "languageId"))
+        mut version = jv_int(jv_get(td, "version"))
+        mut text    = jv_str(jv_get(td, "text"))
+        self.store.open(uri, lang, version, text)
+        self.analyze_and_publish(uri)
+        return true
+
+    def on_did_change(self, params: JsonVal) -> bool:
+        mut td      = jv_get(params, "textDocument")
+        mut uri     = jv_str(jv_get(td, "uri"))
+        mut version = jv_int(jv_get(td, "version"))
+        mut changes = jv_get(params, "contentChanges")
+        mut new_text = ""
+        if jv_arr_len(changes) > 0:
+            new_text = jv_str(jv_get(jv_arr_get(changes, 0), "text"))
+        self.store.change(uri, version, new_text)
+        self.analyze_and_publish(uri)
+        return true
+
+    def on_did_close(self, params: JsonVal) -> bool:
+        mut td  = jv_get(params, "textDocument")
+        mut uri = jv_str(jv_get(td, "uri"))
+        self.store.close(uri)
+        mut empty = Vec[JsonVal].init(0)
+        rpc_write(rpc_notify("textDocument/publishDiagnostics", lsp_publish_diagnostics(uri, empty)))
+        return true
+
+    def on_did_save(self, params: JsonVal) -> bool:
+        mut td  = jv_get(params, "textDocument")
+        mut uri = jv_str(jv_get(td, "uri"))
+        self.analyze_and_publish(uri)
+        return true
+
+    # ── Analysis ───────────────────────────────────────────────────────────────
+
+    def analyze_and_publish(self, uri: str):
+        if not self.store.has(uri): return
+        mut doc    = self.store.get(uri)
+        mut result = self.analyzer.analyze(doc)
+        mut diags  = Vec[JsonVal].init(result.diagnostics.len)
+        mut i = 0
+        while i < result.diagnostics.len:
+            mut d = result.diagnostics.get(i)
+            diags.push(lsp_diagnostic(d.line, d.col, d.end_line, d.end_col, d.severity, d.message, d.code))
+            i = i + 1
+        rpc_write(rpc_notify("textDocument/publishDiagnostics", lsp_publish_diagnostics(uri, diags)))
+        self.log("analyzed " + uri + ": " + result.diagnostics.len.to_str() + " diags")
+
+    # ── Queries ────────────────────────────────────────────────────────────────
+
+    def on_hover(self, id: JsonVal, params: JsonVal) -> bool:
+        mut uri = jv_str(jv_get_path(params, "textDocument.uri"))
+        mut pos = jv_get(params, "position")
+        mut doc = self.store.get(uri)
+        rpc_write(rpc_response(id, provide_hover(doc, pos_line(pos), pos_char(pos))))
+        return true
+
+    def on_completion(self, id: JsonVal, params: JsonVal) -> bool:
+        mut uri = jv_str(jv_get_path(params, "textDocument.uri"))
+        mut pos = jv_get(params, "position")
+        mut doc = self.store.get(uri)
+        rpc_write(rpc_response(id, provide_completions(doc, pos_line(pos), pos_char(pos))))
+        return true
+
+    def on_definition(self, id: JsonVal, params: JsonVal) -> bool:
+        mut uri = jv_str(jv_get_path(params, "textDocument.uri"))
+        mut pos = jv_get(params, "position")
+        mut doc = self.store.get(uri)
+        rpc_write(rpc_response(id, provide_definition(self.store, doc, pos_line(pos), pos_char(pos))))
+        return true
+
+    def on_document_symbols(self, id: JsonVal, params: JsonVal) -> bool:
+        mut uri  = jv_str(jv_get_path(params, "textDocument.uri"))
+        mut doc  = self.store.get(uri)
+        mut ra   = self.analyzer.analyze(doc)
+        rpc_write(rpc_response(id, provide_document_symbols(ra.symbols)))
+        return true
+
+    def on_workspace_symbols(self, id: JsonVal, params: JsonVal) -> bool:
+        mut query = jv_str(jv_get(params, "query"))
+        rpc_write(rpc_response(id, provide_workspace_symbols(self.store, query)))
+        return true
+
+    def on_semantic_tokens(self, id: JsonVal, params: JsonVal) -> bool:
+        mut uri = jv_str(jv_get_path(params, "textDocument.uri"))
+        mut doc = self.store.get(uri)
+        rpc_write(rpc_response(id, provide_semantic_tokens(doc)))
+        return true
+
+    def log(self, msg: str):
+        if self.log_file.len() == 0: return
+        File.append_text(self.log_file, "[tauraro-lsp] " + msg + "\n")
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _str_arr_v(v: Vec[str]) -> JsonVal:
+    mut arr = JArrBuilder.init()
+    mut i = 0
+    while i < v.len:
+        arr.add(jstr(v.get(i)))
+        i = i + 1
+    return arr.build()
+
+def _semantic_tokens_legend() -> JsonVal:
+    mut types = Vec[str].init(16)
+    types.push("namespace"); types.push("type"); types.push("class")
+    types.push("enum"); types.push("interface"); types.push("struct")
+    types.push("function"); types.push("method"); types.push("property")
+    types.push("variable"); types.push("parameter"); types.push("keyword")
+    types.push("comment"); types.push("string"); types.push("number")
+    types.push("operator")
+
+    mut mods = Vec[str].init(4)
+    mods.push("declaration"); mods.push("readonly")
+    mods.push("static"); mods.push("deprecated")
+
+    mut b = JObjBuilder.init()
+    b.add("tokenTypes",     _str_arr_v(types))
+    b.add("tokenModifiers", _str_arr_v(mods))
+    return b.build()

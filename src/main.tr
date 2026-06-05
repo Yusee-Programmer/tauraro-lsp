@@ -1,0 +1,90 @@
+# main.tr — tauraro-lsp entry point.
+# Reads JSON-RPC messages from stdin in a loop, dispatches each to the server.
+#
+# Usage:
+#   tauraro-lsp [--log <file>]
+#
+# The server communicates via stdin/stdout using Content-Length framing
+# (LSP specification §3.7).
+
+from std.os import OS, Env
+from rpc import rpc_read, rpc_write, rpc_notify, rpc_error, rpc_is_terminal
+from json import jstr, jv_get, jv_str, jv_is_null, JObjBuilder
+from server import LspServer
+
+def main(argv: Vec[str]) -> int:
+    mut server = LspServer.init()
+
+    # Parse CLI args
+    mut i = 1
+    while i < argv.len:
+        mut arg = argv.get(i)
+        if (arg == "--log" or arg == "-l") and i + 1 < argv.len:
+            i = i + 1
+            server.log_file = argv.get(i)
+        elif arg == "--compiler" and i + 1 < argv.len:
+            i = i + 1
+            server.analyzer.compiler_path = argv.get(i)
+        elif arg == "--help" or arg == "-h":
+            _print_help()
+            return 0
+        elif arg == "--version":
+            print("tauraro-lsp 0.1.0")
+            return 0
+        i = i + 1
+
+    # When run directly from a terminal (not from an IDE pipe), print usage
+    # and wait — stdin is a TTY so the LSP would immediately get EOF from the
+    # console and exit, which looks like a crash.
+    if rpc_is_terminal():
+        print("tauraro-lsp 0.1.0")
+        print("")
+        print("This is a Language Server Protocol server.")
+        print("It communicates via stdin/stdout — start it from your IDE, not the terminal.")
+        print("")
+        print("Quick setup:")
+        print("  VS Code:  set \"tauraro.lspPath\": \"path/to/tauraro-lsp\" in settings.json")
+        print("  Neovim:   add server entry in nvim-lspconfig")
+        print("  Any LSP:  command = [\"path/to/tauraro-lsp\"], transport = stdio")
+        print("")
+        print("Options:  tauraro-lsp --help")
+        return 0
+
+    server.log("tauraro-lsp 0.1.0 starting")
+    server.log("compiler: " + server.analyzer.compiler_path)
+
+    # Main loop: read → dispatch → repeat
+    mut running = true
+    while running:
+        mut msg = rpc_read()
+        running = server.handle(msg)
+
+    server.log("tauraro-lsp exiting")
+    return 0
+
+
+def _print_help():
+    print("tauraro-lsp 0.1.0 — Language Server Protocol for Tauraro")
+    print("")
+    print("Usage:  tauraro-lsp [options]")
+    print("        Communicates via stdin/stdout (JSON-RPC 2.0 + Content-Length)")
+    print("")
+    print("Options:")
+    print("  --log <file>       Write debug log to <file>")
+    print("  --compiler <path>  Path to tauraroc binary (default: auto-discover)")
+    print("  --version          Print version and exit")
+    print("  --help             Show this help")
+    print("")
+    print("Supported LSP features:")
+    print("  textDocument/publishDiagnostics  (errors, warnings)")
+    print("  textDocument/hover               (type info, keyword docs)")
+    print("  textDocument/completion          (keywords, types, identifiers, methods)")
+    print("  textDocument/definition          (go-to-definition)")
+    print("  textDocument/documentSymbol      (outline view)")
+    print("  workspace/symbol                 (global symbol search)")
+    print("  textDocument/semanticTokens/full (syntax highlighting)")
+    print("")
+    print("IDE setup:")
+    print("  VS Code:    Install the 'Tauraro' extension and set 'tauraro.lspPath'")
+    print("  Neovim:     Use nvim-lspconfig with the 'taurarols' server entry")
+    print("  Any LSP:    Point the client at this binary with stdio transport")

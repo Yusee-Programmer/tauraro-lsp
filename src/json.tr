@@ -1,0 +1,387 @@
+# json.tr — JSON value type, parser, and serializer.
+# Supports the full JSON spec as needed by LSP messages.
+
+from core.alloc import alloc
+
+pub enum JsonVal:
+    JNull
+    JBool(v: bool)
+    JInt(v: int)
+    JFloat(v: float)
+    JStr(s: str)
+    JArr(items: Vec[Pointer[JsonVal]])
+    JObj(keys: Vec[str], vals: Vec[Pointer[JsonVal]])
+
+pub def box_jv(v: JsonVal) -> Pointer[JsonVal]:
+    mut p = alloc[JsonVal](1)
+    p.write(v)
+    return p
+
+# ── Constructors ──────────────────────────────────────────────────────────────
+
+pub def jnull() -> JsonVal: return JsonVal.JNull
+pub def jbool(v: bool) -> JsonVal: return JsonVal.JBool(v)
+pub def jint(n: int) -> JsonVal: return JsonVal.JInt(n)
+pub def jfloat(n: float) -> JsonVal: return JsonVal.JFloat(n)
+pub def jstr(s: str) -> JsonVal: return JsonVal.JStr(s)
+pub def jarr(items: Vec[Pointer[JsonVal]]) -> JsonVal: return JsonVal.JArr(items)
+pub def jobj(keys: Vec[str], vals: Vec[Pointer[JsonVal]]) -> JsonVal: return JsonVal.JObj(keys, vals)
+
+pub def jobj_empty() -> JsonVal:
+    return JsonVal.JObj(Vec[str].init(0), Vec[Pointer[JsonVal]].init(0))
+
+# ── Accessors ────────────────────────────────────────────────────────────────
+
+pub def jv_is_null(v: JsonVal) -> bool:
+    match v:
+        case JsonVal.JNull: return true
+        case _: return false
+
+pub def jv_str(v: JsonVal) -> str:
+    match v:
+        case JsonVal.JStr(s): return s
+        case JsonVal.JInt(n): return n.to_str()
+        case JsonVal.JBool(b):
+            if b: return "true"
+            return "false"
+        case _: return ""
+
+pub def jv_int(v: JsonVal) -> int:
+    match v:
+        case JsonVal.JInt(n): return n
+        case JsonVal.JFloat(f): return f.to_int()
+        case _: return 0
+
+pub def jv_bool(v: JsonVal) -> bool:
+    match v:
+        case JsonVal.JBool(b): return b
+        case _: return false
+
+pub def jv_get(v: JsonVal, key: str) -> JsonVal:
+    match v:
+        case JsonVal.JObj(keys, vals):
+            mut i = 0
+            while i < keys.len:
+                if keys.get(i) == key:
+                    return vals.get(i).read()
+                i = i + 1
+        case _: pass
+    return JsonVal.JNull
+
+pub def jv_get_path(v: JsonVal, path: str) -> JsonVal:
+    mut parts = path.split(".")
+    mut cur = v
+    mut i = 0
+    while i < parts.len:
+        cur = jv_get(cur, parts.get(i))
+        i = i + 1
+    return cur
+
+pub def jv_arr_len(v: JsonVal) -> int:
+    match v:
+        case JsonVal.JArr(items): return items.len
+        case _: return 0
+
+pub def jv_arr_get(v: JsonVal, i: int) -> JsonVal:
+    match v:
+        case JsonVal.JArr(items):
+            if i >= 0 and i < items.len: return items.get(i).read()
+        case _: pass
+    return JsonVal.JNull
+
+# ── Parser ───────────────────────────────────────────────────────────────────
+
+pub class JsonParser:
+    pub src: str
+    pub pos: int
+    pub len: int
+
+extend JsonParser:
+    pub def init(src: str) -> JsonParser:
+        mut p = JsonParser()
+        p.src = src
+        p.pos = 0
+        p.len = src.len()
+        return p
+
+    def peek(self) -> int:
+        if self.pos >= self.len: return 0
+        return self.src.char_at(self.pos)
+
+    def advance(self) -> int:
+        mut c = self.peek()
+        self.pos = self.pos + 1
+        return c
+
+    def skip_ws(self):
+        while self.pos < self.len:
+            mut c = self.peek()
+            if c == 32 or c == 9 or c == 10 or c == 13:
+                self.pos = self.pos + 1
+            else:
+                break
+
+    pub def parse(self) -> JsonVal:
+        self.skip_ws()
+        mut c = self.peek()
+        if c == 110: return self.parse_null()      # 'n'
+        if c == 116: return self.parse_true()      # 't'
+        if c == 102: return self.parse_false()     # 'f'
+        if c == 34:  return self.parse_string()    # '"'
+        if c == 91:  return self.parse_array()     # '['
+        if c == 123: return self.parse_object()    # '{'
+        if c == 45 or (c >= 48 and c <= 57):       # '-' or digit
+            return self.parse_number()
+        return JsonVal.JNull
+
+    def parse_null(self) -> JsonVal:
+        self.pos = self.pos + 4
+        return JsonVal.JNull
+
+    def parse_true(self) -> JsonVal:
+        self.pos = self.pos + 4
+        return JsonVal.JBool(true)
+
+    def parse_false(self) -> JsonVal:
+        self.pos = self.pos + 5
+        return JsonVal.JBool(false)
+
+    def parse_string(self) -> JsonVal:
+        return JsonVal.JStr(self.read_string())
+
+    def read_string(self) -> str:
+        self.pos = self.pos + 1  # consume opening "
+        mut sb = ""
+        while self.pos < self.len:
+            mut c = self.advance()
+            if c == 34: break          # closing "
+            elif c == 92:              # backslash escape
+                mut esc = self.advance()
+                if esc == 110:  sb = sb + "\n"
+                elif esc == 116: sb = sb + "\t"
+                elif esc == 114: sb = sb + "\r"
+                elif esc == 34:  sb = sb + "\""
+                elif esc == 92:  sb = sb + "\\"
+                elif esc == 47:  sb = sb + "/"
+                elif esc == 98:  sb = sb + "\n"   # \b → newline approx
+                elif esc == 102: sb = sb + " "    # \f → space approx
+                elif esc == 117:
+                    # \uXXXX — read 4 hex digits, emit as-is for now
+                    mut hex = ""
+                    mut hi = 0
+                    while hi < 4 and self.pos < self.len:
+                        hex = hex + self.src.slice(self.pos, self.pos + 1)
+                        self.pos = self.pos + 1
+                        hi = hi + 1
+                    # Simple BMP mapping: just append the raw chars for common ASCII
+                    mut code = _hex4_to_int(hex)
+                    if code >= 32 and code < 128:
+                        sb = sb + _int_to_char_str(code)
+                else:
+                    sb = sb + self.src.slice(self.pos - 1, self.pos)
+            else:
+                sb = sb + self.src.slice(self.pos - 1, self.pos)
+        return sb
+
+    def parse_number(self) -> JsonVal:
+        mut start = self.pos
+        mut is_float = false
+        if self.peek() == 45: self.pos = self.pos + 1  # '-'
+        while self.pos < self.len:
+            mut c = self.peek()
+            if c >= 48 and c <= 57:
+                self.pos = self.pos + 1
+            elif c == 46 or c == 101 or c == 69 or c == 43 or c == 45:
+                is_float = true
+                self.pos = self.pos + 1
+            else:
+                break
+        mut num_str = self.src.slice(start, self.pos)
+        if is_float:
+            return JsonVal.JFloat(num_str.parse_float())
+        return JsonVal.JInt(num_str.parse_int())
+
+    def parse_array(self) -> JsonVal:
+        self.pos = self.pos + 1  # consume '['
+        mut items = Vec[Pointer[JsonVal]].init(8)
+        self.skip_ws()
+        if self.peek() == 93:
+            self.pos = self.pos + 1
+            return JsonVal.JArr(items)
+        while self.pos < self.len:
+            self.skip_ws()
+            mut v = self.parse()
+            items.push(box_jv(v))
+            self.skip_ws()
+            mut c = self.peek()
+            if c == 44: self.pos = self.pos + 1  # ','
+            elif c == 93:
+                self.pos = self.pos + 1
+                break
+            else: break
+        return JsonVal.JArr(items)
+
+    def parse_object(self) -> JsonVal:
+        self.pos = self.pos + 1  # consume '{'
+        mut keys = Vec[str].init(8)
+        mut vals = Vec[Pointer[JsonVal]].init(8)
+        self.skip_ws()
+        if self.peek() == 125:
+            self.pos = self.pos + 1
+            return JsonVal.JObj(keys, vals)
+        while self.pos < self.len:
+            self.skip_ws()
+            if self.peek() != 34: break
+            mut k = self.read_string()
+            self.skip_ws()
+            if self.peek() == 58: self.pos = self.pos + 1  # ':'
+            self.skip_ws()
+            mut v = self.parse()
+            keys.push(k)
+            vals.push(box_jv(v))
+            self.skip_ws()
+            mut c = self.peek()
+            if c == 44: self.pos = self.pos + 1  # ','
+            elif c == 125:
+                self.pos = self.pos + 1
+                break
+            else: break
+        return JsonVal.JObj(keys, vals)
+
+
+pub def json_parse(s: str) -> JsonVal:
+    mut p = JsonParser.init(s)
+    return p.parse()
+
+# ── Serializer ────────────────────────────────────────────────────────────────
+
+pub def json_str(v: JsonVal) -> str:
+    match v:
+        case JsonVal.JNull:    return "null"
+        case JsonVal.JBool(b): if b: return "true"; return "false"
+        case JsonVal.JInt(n):  return n.to_str()
+        case JsonVal.JFloat(f): return f.to_str()
+        case JsonVal.JStr(s):  return "\"" + _json_escape(s) + "\""
+        case JsonVal.JArr(items):
+            mut sb = "["
+            mut i = 0
+            while i < items.len:
+                if i > 0: sb = sb + ","
+                sb = sb + json_str(items.get(i).read())
+                i = i + 1
+            return sb + "]"
+        case JsonVal.JObj(keys, vals):
+            mut sb = "{"
+            mut i = 0
+            while i < keys.len:
+                if i > 0: sb = sb + ","
+                sb = sb + "\"" + _json_escape(keys.get(i)) + "\":"
+                sb = sb + json_str(vals.get(i).read())
+                i = i + 1
+            return sb + "}"
+    return "null"
+
+# ── Builder helpers ───────────────────────────────────────────────────────────
+
+pub class JObjBuilder:
+    pub keys: Vec[str]
+    pub vals: Vec[Pointer[JsonVal]]
+
+extend JObjBuilder:
+    pub def init() -> JObjBuilder:
+        mut b = JObjBuilder()
+        b.keys = Vec[str].init(8)
+        b.vals = Vec[Pointer[JsonVal]].init(8)
+        return b
+
+    # add() mutates self and returns self so callers can chain:
+    #   mut b = JObjBuilder.init()
+    #       .add("k",  v)
+    #       .add("k2", v2)
+    #       .build()
+    pub def add(self, key: str, val: JsonVal) -> JObjBuilder:
+        self.keys.push(key)
+        self.vals.push(box_jv(val))
+        return self
+
+    pub def build(self) -> JsonVal:
+        return JsonVal.JObj(self.keys, self.vals)
+
+
+pub class JArrBuilder:
+    pub items: Vec[Pointer[JsonVal]]
+
+extend JArrBuilder:
+    pub def init() -> JArrBuilder:
+        mut b = JArrBuilder()
+        b.items = Vec[Pointer[JsonVal]].init(8)
+        return b
+
+    pub def add(self, val: JsonVal) -> JArrBuilder:
+        self.items.push(box_jv(val))
+        return self
+
+    pub def build(self) -> JsonVal:
+        return JsonVal.JArr(self.items)
+
+
+# ── Internals ────────────────────────────────────────────────────────────────
+
+def _json_escape(s: str) -> str:
+    mut out = ""
+    mut i = 0
+    mut n = s.len()
+    while i < n:
+        mut c = s.char_at(i)
+        if c == 34:  out = out + "\\\""
+        elif c == 92: out = out + "\\\\"
+        elif c == 10: out = out + "\\n"
+        elif c == 13: out = out + "\\r"
+        elif c == 9:  out = out + "\\t"
+        elif c < 32:
+            out = out + "\\u00" + _hex2(c)
+        else:
+            out = out + s.slice(i, i + 1)
+        i = i + 1
+    return out
+
+def _hex2(n: int) -> str:
+    mut hi = n / 16
+    mut lo = n - hi * 16
+    return _hex_digit(hi) + _hex_digit(lo)
+
+def _hex_digit(n: int) -> str:
+    if n < 10: return n.to_str()
+    if n == 10: return "a"
+    if n == 11: return "b"
+    if n == 12: return "c"
+    if n == 13: return "d"
+    if n == 14: return "e"
+    return "f"
+
+def _hex4_to_int(s: str) -> int:
+    mut result = 0
+    mut i = 0
+    while i < s.len():
+        result = result * 16 + _hex_char_val(s.char_at(i))
+        i = i + 1
+    return result
+
+def _hex_char_val(c: int) -> int:
+    if c >= 48 and c <= 57: return c - 48
+    if c >= 97 and c <= 102: return c - 87
+    if c >= 65 and c <= 70:  return c - 55
+    return 0
+
+def _int_to_char_str(code: int) -> str:
+    # Build a 1-char string from an ASCII code point
+    mut buf = " "
+    unsafe:
+        mut p = buf as Pointer[char]
+        p.write(code as char)
+    return buf
+
+# Force Vec[JsonVal] list type generation so List_JsonVal is emitted to tauraro_types.h.
+def _force_json_list_types():
+    mut _v  = Vec[JsonVal].init(0)
+    mut _p  = Vec[Pointer[JsonVal]].init(0)

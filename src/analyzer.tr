@@ -1,0 +1,373 @@
+# analyzer.tr — Runs tauraroc on a document and collects diagnostics + symbols.
+# Uses tauraroc --check (sema-only, no codegen) via subprocess for reliability.
+# Falls back to tauraroc --emit c if --check is not available.
+
+from std.io import File
+from std.os import OS, Process, Env
+from document import TextDocument, uri_to_path
+
+pub class Diagnostic:
+    pub line:     int   # 0-based
+    pub col:      int   # 0-based
+    pub end_line: int
+    pub end_col:  int
+    pub severity: int   # 1=error 2=warning 3=info
+    pub message:  str
+    pub code:     str   # e.g. "M-1", "F-3"
+
+extend Diagnostic:
+    pub def init(line: int, col: int, severity: int, message: str, code: str) -> Diagnostic:
+        mut d = Diagnostic()
+        d.line     = line
+        d.col      = col
+        d.end_line = line
+        d.end_col  = 9999
+        d.severity = severity
+        d.message  = message
+        d.code     = code
+        return d
+
+
+pub class SymbolInfo:
+    pub name:     str
+    pub kind:     int    # LSP SymbolKind: 5=Class 6=Method 12=Function 13=Variable 10=Enum
+    pub line:     int    # 0-based
+    pub end_line: int
+    pub detail:   str    # e.g. return type
+
+
+pub class AnalysisResult:
+    pub diagnostics: Vec[Diagnostic]
+    pub symbols:     Vec[SymbolInfo]
+    pub ok:          bool
+
+extend AnalysisResult:
+    pub def init() -> AnalysisResult:
+        mut r = AnalysisResult()
+        r.diagnostics = Vec[Diagnostic].init(16)
+        r.symbols     = Vec[SymbolInfo].init(32)
+        r.ok          = true
+        return r
+
+
+pub class Analyzer:
+    pub compiler_path: str    # path to tauraroc binary
+
+extend Analyzer:
+    pub def init(compiler_path: str) -> Analyzer:
+        mut a = Analyzer()
+        a.compiler_path = compiler_path
+        return a
+
+    # Analyze a document by writing it to a temp file and running tauraroc --check.
+    pub def analyze(self, doc: TextDocument) -> AnalysisResult:
+        mut result = AnalysisResult.init()
+
+        # Write content to a temp file
+        mut tmp_path = _tmp_path(doc.uri)
+        File.write_text(tmp_path, doc.text)
+
+        # Run tauraroc --check <file>
+        mut compiler = self.compiler_path
+        if compiler.len() == 0:
+            compiler = _find_compiler()
+        if compiler.len() == 0:
+            mut d = Diagnostic.init(0, 0, 3, "tauraroc not found — install it or set TAURARO_PATH", "")
+            result.diagnostics.push(d)
+            result.ok = false
+            return result
+
+        mut cmd = "\"" + compiler + "\" \"" + tmp_path + "\" --check 2>&1"
+        mut output = _capture(cmd)
+
+        # Parse compiler output into diagnostics
+        _parse_output(output, result)
+
+        # Extract symbols from the document text directly (fast, no compiler needed)
+        _extract_symbols(doc, result)
+
+        # Clean up temp file
+        if OS.is_windows():
+            Process.system("del /Q \"" + tmp_path + "\" 2>nul")
+        else:
+            Process.system("rm -f \"" + tmp_path + "\"")
+
+        return result
+
+
+# ── Output parsing ────────────────────────────────────────────────────────────
+
+def _parse_output(output: str, result: AnalysisResult):
+    mut lines = output.split("\n")
+    mut i = 0
+    while i < lines.len:
+        mut line = lines.get(i).trim()
+        if line.len() == 0:
+            i = i + 1
+            continue
+
+        # Format: "error: line N: [CODE] message"
+        # Format: "warning: line N: [CODE] message"
+        # Format: "Parser error: unexpected token=X at pos=N"
+        mut severity = 0
+        mut rest = ""
+        if line.starts_with("error: "):
+            severity = 1
+            rest = line.slice(7, line.len())
+        elif line.starts_with("warning: "):
+            severity = 2
+            rest = line.slice(9, line.len())
+        elif line.starts_with("Parser error:"):
+            severity = 1
+            rest = line.slice(13, line.len()).trim()
+            mut d = Diagnostic.init(0, 0, severity, "Parser error: " + rest, "parse")
+            result.diagnostics.push(d)
+            result.ok = false
+            i = i + 1
+            continue
+
+        if severity == 0:
+            i = i + 1
+            continue
+
+        # Extract "line N:" prefix
+        mut lnum = 0
+        mut msg  = rest
+        if rest.starts_with("line "):
+            mut after_line = rest.slice(5, rest.len())
+            mut colon = after_line.index_of(":")
+            if colon > 0:
+                lnum = after_line.slice(0, colon).trim().parse_int()
+                if lnum > 0: lnum = lnum - 1  # convert to 0-based
+                msg = after_line.slice(colon + 1, after_line.len()).trim()
+
+        # Extract error code from "[X-N]" at start of message
+        mut code = ""
+        if msg.starts_with("["):
+            mut close = msg.index_of("]")
+            if close > 0:
+                code = msg.slice(1, close)
+                msg  = msg.slice(close + 1, msg.len()).trim()
+
+        if severity > 0 and msg.len() > 0:
+            mut d = Diagnostic.init(lnum, 0, severity, msg, code)
+            result.diagnostics.push(d)
+            if severity == 1: result.ok = false
+
+        i = i + 1
+
+
+# ── Symbol extraction (regex-free, line-by-line) ─────────────────────────────
+
+def _extract_symbols(doc: TextDocument, result: AnalysisResult):
+    mut i = 0
+    while i < doc.line_count():
+        mut line = doc.get_line(i).trim()
+
+        # pub def name(...) / def name(...)
+        if line.starts_with("pub def ") or line.starts_with("def "):
+            mut offset = 4
+            if line.starts_with("pub "): offset = 8
+            mut name = _extract_ident(line, offset)
+            if name.len() > 0:
+                mut sym = SymbolInfo()
+                sym.name     = name
+                sym.kind     = 12  # Function
+                sym.line     = i
+                sym.end_line = _find_block_end(doc, i)
+                sym.detail   = _extract_return_type(line)
+                result.symbols.push(sym)
+
+        # pub class Name / class Name
+        elif line.starts_with("pub class ") or line.starts_with("class "):
+            mut offset = 6
+            if line.starts_with("pub "): offset = 10
+            mut name = _extract_ident(line, offset)
+            if name.len() > 0:
+                mut sym = SymbolInfo()
+                sym.name     = name
+                sym.kind     = 5  # Class
+                sym.line     = i
+                sym.end_line = _find_block_end(doc, i)
+                sym.detail   = ""
+                result.symbols.push(sym)
+
+        # pub enum Name / enum Name
+        elif line.starts_with("pub enum ") or line.starts_with("enum "):
+            mut offset = 5
+            if line.starts_with("pub "): offset = 9
+            mut name = _extract_ident(line, offset)
+            if name.len() > 0:
+                mut sym = SymbolInfo()
+                sym.name     = name
+                sym.kind     = 10  # Enum
+                sym.line     = i
+                sym.end_line = _find_block_end(doc, i)
+                sym.detail   = ""
+                result.symbols.push(sym)
+
+        # extend ClassName:
+        elif line.starts_with("extend "):
+            mut name = _extract_ident(line, 7)
+            if name.len() > 0:
+                mut sym = SymbolInfo()
+                sym.name     = name + " (extend)"
+                sym.kind     = 5  # Class
+                sym.line     = i
+                sym.end_line = _find_block_end(doc, i)
+                sym.detail   = "extend"
+                result.symbols.push(sym)
+
+        # pub interface Name / interface Name
+        elif line.starts_with("pub interface ") or line.starts_with("interface "):
+            mut offset = 10
+            if line.starts_with("pub "): offset = 14
+            mut name = _extract_ident(line, offset)
+            if name.len() > 0:
+                mut sym = SymbolInfo()
+                sym.name     = name
+                sym.kind     = 11  # Interface
+                sym.line     = i
+                sym.end_line = _find_block_end(doc, i)
+                sym.detail   = ""
+                result.symbols.push(sym)
+
+        i = i + 1
+
+
+def _extract_ident(s: str, start: int) -> str:
+    mut i = start
+    mut n = s.len()
+    while i < n:
+        mut c = s.char_at(i)
+        if (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95:
+            i = i + 1
+        else:
+            break
+    if i == start: return ""
+    return s.slice(start, i)
+
+def _extract_return_type(line: str) -> str:
+    mut arrow = line.index_of("->")
+    if arrow < 0: return ""
+    mut rest = line.slice(arrow + 2, line.len()).trim()
+    mut colon = rest.index_of(":")
+    if colon >= 0: rest = rest.slice(0, colon).trim()
+    return rest
+
+def _find_block_end(doc: TextDocument, start: int) -> int:
+    mut i = start + 1
+    mut n = doc.line_count()
+    while i < n:
+        mut line = doc.get_line(i)
+        if line.len() > 0 and line.char_at(0) != 32 and line.char_at(0) != 9:
+            return i - 1
+        i = i + 1
+    return n - 1
+
+
+# ── Compiler discovery ────────────────────────────────────────────────────────
+
+pub def _find_compiler() -> str:
+    # 1. TAURARO env var
+    mut env_path = Env.get_var("TAURARO")
+    if env_path.len() > 0 and File.file_exists(env_path): return env_path
+
+    # 2. TAURARO_PATH — colon-separated list of directories
+    mut tp = Env.get_var("TAURARO_PATH")
+    if tp.len() > 0:
+        mut parts = tp.split(":")
+        mut i = 0
+        while i < parts.len:
+            mut candidate = parts.get(i).trim() + "/tauraroc"
+            if OS.is_windows(): candidate = candidate + ".exe"
+            if File.file_exists(candidate): return candidate
+            i = i + 1
+
+    # 3. ~/.taupkg/bin/tauraroc-*/tauraroc[.exe]
+    mut home = ""
+    if OS.is_windows():
+        home = Env.get_var("USERPROFILE")
+    else:
+        home = Env.get_var("HOME")
+    if home.len() > 0:
+        mut bin_root = home + "/.taupkg/bin"
+        mut dirs = _list_dirs(bin_root)
+        mut i = 0
+        while i < dirs.len:
+            mut d = dirs.get(i)
+            if d.starts_with("tauraroc-"):
+                mut candidate = bin_root + "/" + d + "/tauraroc"
+                if OS.is_windows(): candidate = candidate + ".exe"
+                if File.file_exists(candidate): return candidate
+            i = i + 1
+
+    # 4. tauraroc on PATH
+    if OS.is_windows():
+        mut out = _capture("where tauraroc.exe 2>nul")
+        mut line = out.split("\n").get(0).trim()
+        if line.len() > 0: return line
+    else:
+        mut out = _capture("command -v tauraroc 2>/dev/null")
+        mut line = out.trim()
+        if line.len() > 0: return line
+
+    return ""
+
+def _list_dirs(path: str) -> Vec[str]:
+    mut dirs = Vec[str].init(4)
+    mut out = ""
+    if OS.is_windows():
+        out = _capture("dir /AD /B \"" + path + "\" 2>nul")
+    else:
+        out = _capture("ls \"" + path + "\" 2>/dev/null")
+    mut lines = out.split("\n")
+    mut i = 0
+    while i < lines.len:
+        mut l = lines.get(i).trim()
+        if l.len() > 0: dirs.push(l)
+        i = i + 1
+    return dirs
+
+def _tmp_path(uri: str) -> str:
+    mut base = ""
+    if OS.is_windows():
+        base = Env.get_var("TEMP")
+        if base.len() == 0: base = Env.get_var("TMP")
+        if base.len() == 0: base = "C:/Windows/Temp"
+    else:
+        base = "/tmp"
+    # Use a hash of the URI for the filename to avoid collisions
+    mut hash = _str_hash(uri)
+    mut suffix = "_lsp_" + hash + ".tr"
+    return base + "/" + suffix
+
+def _str_hash(s: str) -> str:
+    # FNV-1a-inspired simple hash → hex string
+    mut h: u64 = 14695981039346656037 as u64
+    mut i = 0
+    while i < s.len():
+        mut c = s.char_at(i) as u64
+        h = (h ^ c) * 1099511628211 as u64
+        i = i + 1
+    # Convert to 8 hex digits
+    mut result = ""
+    mut shift = 28
+    while shift >= 0:
+        mut nibble = ((h as int) >> shift) & 15
+        result = result + _hex_nibble(nibble)
+        shift = shift - 4
+    return result
+
+def _hex_nibble(n: int) -> str:
+    if n < 10: return n.to_str()
+    if n == 10: return "a"
+    if n == 11: return "b"
+    if n == 12: return "c"
+    if n == 13: return "d"
+    if n == 14: return "e"
+    return "f"
+
+def _capture(cmd: str) -> str:
+    from std.os import Process
+    return Process.shell_output(cmd)

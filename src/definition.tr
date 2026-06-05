@@ -1,0 +1,109 @@
+# definition.tr — Go-to-definition provider.
+# Searches the current document and imported modules for declarations.
+
+from document import TextDocument, DocumentStore, uri_to_path, path_to_uri
+from protocol import lsp_location
+from json import JsonVal, jnull
+
+pub def provide_definition(store: DocumentStore, doc: TextDocument, line: int, character: int) -> JsonVal:
+    mut word = doc.word_at(line, character)
+    if word.len() == 0: return jnull()
+    if _is_builtin(word): return jnull()
+
+    # 1. Search within the current document
+    mut result = _search_doc(doc, word, line)
+    if not jv_is_null_def(result): return result
+
+    # 2. Search imported modules
+    mut imports = _collect_imports(doc)
+    mut ii = 0
+    while ii < imports.len:
+        mut imp_uri = imports.get(ii)
+        if store.has(imp_uri):
+            mut imp_doc = store.get(imp_uri)
+            mut r2 = _search_doc(imp_doc, word, -1)
+            if not jv_is_null_def(r2): return r2
+        ii = ii + 1
+
+    return jnull()
+
+
+def _search_doc(doc: TextDocument, word: str, skip_line: int) -> JsonVal:
+    mut i = 0
+    while i < doc.line_count():
+        if i == skip_line:
+            i = i + 1
+            continue
+        mut line = doc.get_line(i).trim()
+
+        # Match: def word / pub def word
+        if _is_decl_of(line, "def", word) or _is_decl_of(line, "pub def", word):
+            return lsp_location(doc.uri, i, 0, i, line.len())
+
+        # Match: class word / pub class word
+        if _is_decl_of(line, "class", word) or _is_decl_of(line, "pub class", word):
+            return lsp_location(doc.uri, i, 0, i, line.len())
+
+        # Match: enum word / pub enum word
+        if _is_decl_of(line, "enum", word) or _is_decl_of(line, "pub enum", word):
+            return lsp_location(doc.uri, i, 0, i, line.len())
+
+        # Match: interface word
+        if _is_decl_of(line, "interface", word) or _is_decl_of(line, "pub interface", word):
+            return lsp_location(doc.uri, i, 0, i, line.len())
+
+        # Match: mut word = / mut word: (variable declaration)
+        if line.starts_with("mut " + word + " ") or line.starts_with("mut " + word + ":") or line.starts_with("mut " + word + "="):
+            return lsp_location(doc.uri, i, 0, i, line.len())
+
+        i = i + 1
+    return jnull()
+
+
+def _is_decl_of(line: str, keyword: str, name: str) -> bool:
+    mut prefix = keyword + " " + name
+    if not line.starts_with(prefix): return false
+    if line.len() <= prefix.len(): return true
+    mut next = line.char_at(prefix.len())
+    # Must be followed by non-ident char: '(', ':', ' ', '<'
+    return next == 40 or next == 58 or next == 32 or next == 60 or next == 91
+
+def _collect_imports(doc: TextDocument) -> Vec[str]:
+    mut uris = Vec[str].init(8)
+    mut i = 0
+    while i < doc.line_count():
+        mut line = doc.get_line(i).trim()
+        if line.starts_with("from "):
+            mut module_path = _extract_import_path(line)
+            if module_path.len() > 0:
+                # Convert module path to file path (rough heuristic)
+                mut file_path = module_path.replace(".", "/") + ".tr"
+                uris.push(path_to_uri("src/" + file_path))
+            i = i + 1
+        elif line.len() > 0 and not line.starts_with("#"):
+            # Stop at first non-import line (after initial imports)
+            if not line.starts_with("from ") and not line.starts_with("import "):
+                if i > 0: break
+        else:
+            i = i + 1
+        i = i + 1
+    return uris
+
+def _extract_import_path(line: str) -> str:
+    # from <module> import <symbols>
+    if not line.starts_with("from "): return ""
+    mut rest = line.slice(5, line.len()).trim()
+    mut space = rest.index_of(" ")
+    if space < 0: return rest
+    return rest.slice(0, space)
+
+def _is_builtin(word: str) -> bool:
+    if word == "int" or word == "float" or word == "str" or word == "bool": return true
+    if word == "char" or word == "void" or word == "true" or word == "false": return true
+    if word == "none" or word == "Vec" or word == "Map" or word == "Pointer": return true
+    if word == "Option" or word == "Result" or word == "print" or word == "len": return true
+    return false
+
+def jv_is_null_def(v: JsonVal) -> bool:
+    from json import jv_is_null
+    return jv_is_null(v)

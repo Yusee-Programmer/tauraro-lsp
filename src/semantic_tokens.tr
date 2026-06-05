@@ -1,0 +1,155 @@
+# semantic_tokens.tr — Full-document semantic token provider.
+# Produces the delta-encoded integer array used by LSP semanticTokens/full.
+# Token types align with the legend returned in initialize capabilities.
+
+from document import TextDocument
+from protocol import STT_KEYWORD, STT_STRING, STT_NUMBER, STT_COMMENT
+from protocol import STT_FUNCTION, STT_CLASS, STT_VARIABLE, STT_TYPE, STT_OPERATOR
+from protocol import STT_PARAMETER, STT_ENUM, STT_NAMESPACE
+from json import JsonVal, JObjBuilder, JArrBuilder, jint
+
+# Tauraro keywords (for token classification)
+def _tauraro_keywords() -> Vec[str]:
+    mut kw = Vec[str].init(48)
+    kw.push("def"); kw.push("pub"); kw.push("mut"); kw.push("class")
+    kw.push("extend"); kw.push("enum"); kw.push("interface"); kw.push("implements")
+    kw.push("if"); kw.push("elif"); kw.push("else"); kw.push("while")
+    kw.push("for"); kw.push("in"); kw.push("return"); kw.push("break")
+    kw.push("continue"); kw.push("match"); kw.push("case"); kw.push("pass")
+    kw.push("true"); kw.push("false"); kw.push("none"); kw.push("and")
+    kw.push("or"); kw.push("not"); kw.push("from"); kw.push("import")
+    kw.push("unsafe"); kw.push("extern"); kw.push("spawn"); kw.push("await")
+    kw.push("async"); kw.push("const"); kw.push("shared"); kw.push("raise")
+    kw.push("try"); kw.push("except"); kw.push("finally"); kw.push("with")
+    kw.push("assert"); kw.push("as"); kw.push("taskgroup")
+    return kw
+
+def _is_kw(word: str, kws: Vec[str]) -> bool:
+    mut i = 0
+    while i < kws.len:
+        if kws.get(i) == word: return true
+        i = i + 1
+    return false
+
+pub def provide_semantic_tokens(doc: TextDocument) -> JsonVal:
+    mut data = Vec[int].init(256)
+    mut prev_line = 0
+    mut prev_start = 0
+    mut keywords = _tauraro_keywords()
+
+    mut line_idx = 0
+    while line_idx < doc.line_count():
+        mut line = doc.get_line(line_idx)
+        mut n = line.len()
+        mut col = 0
+
+        while col < n:
+            mut c = line.char_at(col)
+
+            # Comment: # until end of line
+            if c == 35:
+                mut length = n - col
+                _push_token(data, line_idx, col, length, STT_COMMENT(), 0, prev_line, prev_start)
+                prev_line  = line_idx
+                prev_start = col
+                break
+
+            # String: " ... " (simple single-line)
+            if c == 34 or c == 39:
+                mut quote = c
+                mut start = col
+                col = col + 1
+                while col < n and line.char_at(col) != quote:
+                    if line.char_at(col) == 92: col = col + 1  # skip escape
+                    col = col + 1
+                if col < n: col = col + 1  # closing quote
+                mut length = col - start
+                _push_token(data, line_idx, start, length, STT_STRING(), 0, prev_line, prev_start)
+                prev_line  = line_idx
+                prev_start = start
+                continue
+
+            # Number: digit or -digit
+            if c >= 48 and c <= 57:
+                mut start = col
+                mut is_float = false
+                while col < n:
+                    mut nc = line.char_at(col)
+                    if nc >= 48 and nc <= 57: col = col + 1
+                    elif nc == 46 or nc == 120 or nc == 98 or nc == 111: # . x b o
+                        is_float = true
+                        col = col + 1
+                    elif nc == 95: col = col + 1  # _ separator
+                    else: break
+                _push_token(data, line_idx, start, col - start, STT_NUMBER(), 0, prev_line, prev_start)
+                prev_line  = line_idx
+                prev_start = start
+                continue
+
+            # Identifier or keyword
+            if _is_alpha_c(c):
+                mut start = col
+                while col < n and (_is_alpha_c(line.char_at(col)) or _is_digit_c(line.char_at(col))):
+                    col = col + 1
+                mut word = line.slice(start, col)
+                mut tok_type = -1
+
+                if _is_kw(word, keywords):
+                    tok_type = STT_KEYWORD()
+                elif _is_type_name(word):
+                    tok_type = STT_TYPE()
+                elif col < n and line.char_at(col) == 40:  # followed by '('
+                    tok_type = STT_FUNCTION()
+                elif _is_upper_start(word):
+                    tok_type = STT_CLASS()
+
+                if tok_type >= 0:
+                    _push_token(data, line_idx, start, col - start, tok_type, 0, prev_line, prev_start)
+                    prev_line  = line_idx
+                    prev_start = start
+                continue
+
+            col = col + 1
+
+        line_idx = line_idx + 1
+
+    # Encode as JsonVal array
+    mut arr = JArrBuilder.init()
+    mut i = 0
+    while i < data.len:
+        arr.add(jint(data.get(i)))
+        i = i + 1
+    return JObjBuilder.init()
+        .add("data", arr.build())
+        .build()
+
+
+def _push_token(data: Vec[int], line: int, start: int, length: int, tok_type: int, modifiers: int, prev_line: int, prev_start: int):
+    mut delta_line = line - prev_line
+    mut delta_start = start
+    if delta_line == 0: delta_start = start - prev_start
+    data.push(delta_line)
+    data.push(delta_start)
+    data.push(length)
+    data.push(tok_type)
+    data.push(modifiers)
+
+def _is_type_name(word: str) -> bool:
+    if word == "int" or word == "float" or word == "str" or word == "bool": return true
+    if word == "char" or word == "void" or word == "u64" or word == "u32": return true
+    if word == "i32" or word == "i8" or word == "Vec" or word == "Map": return true
+    if word == "Pointer" or word == "Option" or word == "Result": return true
+    if word == "Shared" or word == "Mutex" or word == "Chan" or word == "Atomic": return true
+    if word == "StringBuilder": return true
+    return false
+
+def _is_upper_start(word: str) -> bool:
+    if word.len() == 0: return false
+    mut c = word.char_at(0)
+    return c >= 65 and c <= 90
+
+def _is_alpha_c(c: int) -> bool:
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+
+def _is_digit_c(c: int) -> bool:
+    return c >= 48 and c <= 57

@@ -1,0 +1,286 @@
+# completion.tr — Completion provider.
+# Provides: keywords, built-in types, identifiers from the current document,
+# and method completions for known types.
+
+from document import TextDocument
+from protocol import lsp_completion_item, lsp_completion_list
+from json import JsonVal, JArrBuilder
+
+pub def provide_completions(doc: TextDocument, line: int, character: int) -> JsonVal:
+    mut items = Vec[JsonVal].init(64)
+
+    mut prefix = _get_prefix(doc, line, character)
+    mut after_dot = _is_after_dot(doc, line, character)
+
+    if after_dot:
+        # Method completions — show methods for the receiver's apparent type
+        mut receiver_type = _infer_receiver_type(doc, line, character)
+        _add_method_completions(items, receiver_type, prefix)
+    else:
+        # Top-level completions
+        if prefix.len() <= 2 or _is_keyword_prefix(prefix):
+            _add_keywords(items, prefix)
+        _add_builtin_types(items, prefix)
+        _add_doc_identifiers(doc, items, prefix)
+
+    return lsp_completion_list(items, false)
+
+
+def _add_keywords(items: Vec[JsonVal], prefix: str):
+    mut keywords = Vec[str].init(32)
+    keywords.push("def")
+    keywords.push("pub")
+    keywords.push("mut")
+    keywords.push("class")
+    keywords.push("extend")
+    keywords.push("enum")
+    keywords.push("interface")
+    keywords.push("implements")
+    keywords.push("if")
+    keywords.push("elif")
+    keywords.push("else")
+    keywords.push("while")
+    keywords.push("for")
+    keywords.push("in")
+    keywords.push("return")
+    keywords.push("break")
+    keywords.push("continue")
+    keywords.push("match")
+    keywords.push("case")
+    keywords.push("pass")
+    keywords.push("true")
+    keywords.push("false")
+    keywords.push("none")
+    keywords.push("and")
+    keywords.push("or")
+    keywords.push("not")
+    keywords.push("from")
+    keywords.push("import")
+    keywords.push("unsafe")
+    keywords.push("extern")
+    keywords.push("spawn")
+    keywords.push("await")
+    keywords.push("async")
+    keywords.push("const")
+    keywords.push("shared")
+    keywords.push("raise")
+    keywords.push("try")
+    keywords.push("except")
+    keywords.push("finally")
+    keywords.push("with")
+    keywords.push("assert")
+    mut i = 0
+    while i < keywords.len:
+        mut kw = keywords.get(i)
+        if prefix.len() == 0 or kw.starts_with(prefix):
+            items.push(lsp_completion_item(kw, 14, "keyword", kw))
+        i = i + 1
+
+def _add_builtin_types(items: Vec[JsonVal], prefix: str):
+    mut types = Vec[str].init(16)
+    types.push("int")
+    types.push("float")
+    types.push("str")
+    types.push("bool")
+    types.push("char")
+    types.push("void")
+    types.push("u64")
+    types.push("u32")
+    types.push("i32")
+    types.push("i8")
+    types.push("Vec")
+    types.push("Map")
+    types.push("Pointer")
+    types.push("Option")
+    types.push("Result")
+    types.push("Shared")
+    types.push("Atomic")
+    types.push("Mutex")
+    types.push("Chan")
+    types.push("StringBuilder")
+    mut i = 0
+    while i < types.len:
+        mut t = types.get(i)
+        if prefix.len() == 0 or t.starts_with(prefix):
+            items.push(lsp_completion_item(t, 7, "type", t))
+        i = i + 1
+
+def _add_method_completions(items: Vec[JsonVal], type_name: str, prefix: str):
+    # str methods
+    if type_name == "str" or type_name == "":
+        mut methods = Vec[str].init(32)
+        methods.push("len()")
+        methods.push("split(sep)")
+        methods.push("trim()")
+        methods.push("strip()")
+        methods.push("to_upper()")
+        methods.push("to_lower()")
+        methods.push("starts_with(prefix)")
+        methods.push("ends_with(suffix)")
+        methods.push("contains(s)")
+        methods.push("index_of(s)")
+        methods.push("slice(start, end)")
+        methods.push("replace(from, to)")
+        methods.push("char_at(i)")
+        methods.push("parse_int()")
+        methods.push("parse_float()")
+        methods.push("parse_bool()")
+        methods.push("to_str()")
+        methods.push("capitalize()")
+        methods.push("reverse()")
+        methods.push("repeat(n)")
+        _add_str_methods(items, methods, prefix, "str")
+
+    # Vec/List methods
+    if type_name == "Vec" or type_name == "List" or type_name == "":
+        mut methods = Vec[str].init(16)
+        methods.push("push(item)")
+        methods.push("pop()")
+        methods.push("get(i)")
+        methods.push("set(i, item)")
+        methods.push("len")
+        methods.push("contains(item)")
+        methods.push("remove(i)")
+        methods.push("clear()")
+        methods.push("is_empty()")
+        _add_str_methods(items, methods, prefix, "Vec")
+
+    # Map methods
+    if type_name == "Map" or type_name == "":
+        mut methods = Vec[str].init(8)
+        methods.push("insert(key, val)")
+        methods.push("get(key)")
+        methods.push("contains(key)")
+        methods.push("remove(key)")
+        _add_str_methods(items, methods, prefix, "Map")
+
+    # int/float methods
+    if type_name == "int" or type_name == "float" or type_name == "":
+        mut methods = Vec[str].init(4)
+        methods.push("to_str()")
+        methods.push("to_float()")
+        methods.push("to_int()")
+        _add_str_methods(items, methods, prefix, "int")
+
+def _add_str_methods(items: Vec[JsonVal], methods: Vec[str], prefix: str, detail: str):
+    mut i = 0
+    while i < methods.len:
+        mut m = methods.get(i)
+        mut name = m
+        mut paren = m.index_of("(")
+        if paren >= 0: name = m.slice(0, paren)
+        if prefix.len() == 0 or name.starts_with(prefix):
+            items.push(lsp_completion_item(name, 2, detail + "." + m, name))
+        i = i + 1
+
+def _add_doc_identifiers(doc: TextDocument, items: Vec[JsonVal], prefix: str):
+    # Collect identifiers already used in the document
+    mut seen = Vec[str].init(64)
+    mut i = 0
+    while i < doc.line_count():
+        mut line = doc.get_line(i)
+        _collect_idents(line, seen, prefix)
+        i = i + 1
+    mut si = 0
+    while si < seen.len:
+        items.push(lsp_completion_item(seen.get(si), 6, "variable", seen.get(si)))
+        si = si + 1
+
+def _collect_idents(line: str, seen: Vec[str], prefix: str):
+    mut i = 0
+    mut n = line.len()
+    while i < n:
+        mut c = line.char_at(i)
+        if _is_alpha(c):
+            mut start = i
+            while i < n and (_is_alpha(line.char_at(i)) or _is_digit(line.char_at(i))):
+                i = i + 1
+            mut ident = line.slice(start, i)
+            if ident.len() > 2 and (prefix.len() == 0 or ident.starts_with(prefix)):
+                if not _is_in(seen, ident) and not _is_keyword(ident):
+                    seen.push(ident)
+        else:
+            i = i + 1
+
+def _get_prefix(doc: TextDocument, line: int, character: int) -> str:
+    mut l = doc.get_line(line)
+    if l.len() == 0: return ""
+    mut end = character
+    if end > l.len(): end = l.len()
+    mut start = end
+    while start > 0 and (_is_alpha(l.char_at(start - 1)) or _is_digit(l.char_at(start - 1))):
+        start = start - 1
+    if start >= end: return ""
+    return l.slice(start, end)
+
+def _is_after_dot(doc: TextDocument, line: int, character: int) -> bool:
+    mut l = doc.get_line(line)
+    mut pos = character - 1
+    # Skip back over the prefix
+    while pos > 0 and (_is_alpha(l.char_at(pos)) or _is_digit(l.char_at(pos))):
+        pos = pos - 1
+    if pos > 0 and l.char_at(pos) == 46: return true  # '.'
+    return false
+
+def _infer_receiver_type(doc: TextDocument, line: int, character: int) -> str:
+    # Very simple: look for "mut x = TypeName" or "x: TypeName" in recent lines
+    mut l = doc.get_line(line)
+    # Find variable name before the dot
+    mut pos = character - 1
+    while pos > 0 and (_is_alpha(l.char_at(pos)) or _is_digit(l.char_at(pos))):
+        pos = pos - 1
+    if pos <= 0 or l.char_at(pos) != 46: return ""
+    pos = pos - 1
+    while pos > 0 and l.char_at(pos) == 32: pos = pos - 1
+    mut end = pos + 1
+    mut start = pos
+    while start > 0 and (_is_alpha(l.char_at(start - 1)) or _is_digit(l.char_at(start - 1))):
+        start = start - 1
+    if start >= end: return ""
+    mut var_name = l.slice(start, end)
+    # Search backwards for "var_name: Type" or "mut var_name = Type"
+    mut search_line = line
+    while search_line >= 0 and search_line > line - 20:
+        mut sl = doc.get_line(search_line).trim()
+        if sl.contains(var_name + ":"):
+            mut colon = sl.index_of(var_name + ":")
+            if colon >= 0:
+                mut after = sl.slice(colon + var_name.len() + 1, sl.len()).trim()
+                return _extract_ident_from(after, 0)
+        search_line = search_line - 1
+    return ""
+
+def _extract_ident_from(s: str, start: int) -> str:
+    mut i = start
+    while i < s.len() and s.char_at(i) == 32: i = i + 1
+    mut begin = i
+    while i < s.len() and (_is_alpha(s.char_at(i)) or _is_digit(s.char_at(i))):
+        i = i + 1
+    if begin >= i: return ""
+    return s.slice(begin, i)
+
+def _is_keyword_prefix(s: str) -> bool:
+    # Return true for short strings likely starting a keyword
+    return s.len() <= 3
+
+def _is_in(v: Vec[str], s: str) -> bool:
+    mut i = 0
+    while i < v.len:
+        if v.get(i) == s: return true
+        i = i + 1
+    return false
+
+def _is_keyword(s: str) -> bool:
+    if s == "def" or s == "pub" or s == "mut" or s == "class": return true
+    if s == "if" or s == "else" or s == "elif" or s == "while": return true
+    if s == "for" or s == "in" or s == "return" or s == "true": return true
+    if s == "false" or s == "none" or s == "and" or s == "or": return true
+    if s == "not" or s == "from" or s == "import" or s == "match": return true
+    if s == "case" or s == "pass" or s == "break" or s == "continue": return true
+    return false
+
+def _is_alpha(c: int) -> bool:
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+
+def _is_digit(c: int) -> bool:
+    return c >= 48 and c <= 57

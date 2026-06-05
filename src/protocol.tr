@@ -1,0 +1,114 @@
+# protocol.tr — LSP type construction helpers.
+
+from json import JsonVal, JObjBuilder, JArrBuilder
+from json import jstr, jint, jbool, jnull, jv_get, jv_int
+
+pub def lsp_position(line: int, character: int) -> JsonVal:
+    mut b = JObjBuilder.init()
+    b.add("line", jint(line))
+    b.add("character", jint(character))
+    return b.build()
+
+pub def lsp_range(start_line: int, start_char: int, end_line: int, end_char: int) -> JsonVal:
+    mut b = JObjBuilder.init()
+    b.add("start", lsp_position(start_line, start_char))
+    b.add("end",   lsp_position(end_line,   end_char))
+    return b.build()
+
+pub def lsp_range_line(line: int) -> JsonVal:
+    return lsp_range(line, 0, line, 9999)
+
+pub def lsp_location(uri: str, start_line: int, start_char: int, end_line: int, end_char: int) -> JsonVal:
+    mut b = JObjBuilder.init()
+    b.add("uri",   jstr(uri))
+    b.add("range", lsp_range(start_line, start_char, end_line, end_char))
+    return b.build()
+
+# severity: 1=Error 2=Warning 3=Information 4=Hint
+pub def lsp_diagnostic(start_line: int, start_char: int, end_line: int, end_char: int, severity: int, message: str, code: str) -> JsonVal:
+    mut b = JObjBuilder.init()
+    b.add("range",    lsp_range(start_line, start_char, end_line, end_char))
+    b.add("severity", jint(severity))
+    b.add("message",  jstr(message))
+    b.add("source",   jstr("tauraroc"))
+    if code.len() > 0:
+        b.add("code", jstr(code))
+    return b.build()
+
+pub def lsp_publish_diagnostics(uri: str, diagnostics: Vec[JsonVal]) -> JsonVal:
+    mut arr = JArrBuilder.init()
+    mut i = 0
+    while i < diagnostics.len:
+        arr.add(diagnostics.get(i))
+        i = i + 1
+    mut b = JObjBuilder.init()
+    b.add("uri",         jstr(uri))
+    b.add("diagnostics", arr.build())
+    return b.build()
+
+pub def lsp_completion_item(label: str, kind: int, detail: str, insert_text: str) -> JsonVal:
+    mut b = JObjBuilder.init()
+    b.add("label", jstr(label))
+    b.add("kind",  jint(kind))
+    if detail.len() > 0:
+        b.add("detail", jstr(detail))
+    if insert_text.len() > 0 and insert_text != label:
+        b.add("insertText", jstr(insert_text))
+    return b.build()
+
+pub def lsp_completion_list(items: Vec[JsonVal], is_incomplete: bool) -> JsonVal:
+    mut arr = JArrBuilder.init()
+    mut i = 0
+    while i < items.len:
+        arr.add(items.get(i))
+        i = i + 1
+    mut b = JObjBuilder.init()
+    b.add("isIncomplete", jbool(is_incomplete))
+    b.add("items",        arr.build())
+    return b.build()
+
+pub def lsp_hover(contents: str, start_line: int, start_char: int, end_line: int, end_char: int) -> JsonVal:
+    mut mk = JObjBuilder.init()
+    mk.add("kind",  jstr("markdown"))
+    mk.add("value", jstr(contents))
+    mut b = JObjBuilder.init()
+    b.add("contents", mk.build())
+    b.add("range",    lsp_range(start_line, start_char, end_line, end_char))
+    return b.build()
+
+pub def lsp_document_symbol(name: str, kind: int, line: int, end_line: int, detail: str) -> JsonVal:
+    mut b = JObjBuilder.init()
+    b.add("name",           jstr(name))
+    b.add("kind",           jint(kind))
+    b.add("range",          lsp_range(line, 0, end_line, 9999))
+    b.add("selectionRange", lsp_range(line, 0, line, name.len()))
+    if detail.len() > 0:
+        b.add("detail", jstr(detail))
+    return b.build()
+
+pub def lsp_text_edit(start_line: int, start_char: int, end_line: int, end_char: int, new_text: str) -> JsonVal:
+    mut b = JObjBuilder.init()
+    b.add("range",   lsp_range(start_line, start_char, end_line, end_char))
+    b.add("newText", jstr(new_text))
+    return b.build()
+
+# Semantic token type indices
+pub def STT_NAMESPACE() -> int:  return 0
+pub def STT_TYPE() -> int:       return 1
+pub def STT_CLASS() -> int:      return 2
+pub def STT_ENUM() -> int:       return 3
+pub def STT_INTERFACE() -> int:  return 4
+pub def STT_STRUCT() -> int:     return 5
+pub def STT_FUNCTION() -> int:   return 6
+pub def STT_METHOD() -> int:     return 7
+pub def STT_PROPERTY() -> int:   return 8
+pub def STT_VARIABLE() -> int:   return 9
+pub def STT_PARAMETER() -> int:  return 10
+pub def STT_KEYWORD() -> int:    return 11
+pub def STT_COMMENT() -> int:    return 12
+pub def STT_STRING() -> int:     return 13
+pub def STT_NUMBER() -> int:     return 14
+pub def STT_OPERATOR() -> int:   return 15
+
+pub def pos_line(p: JsonVal) -> int: return jv_int(jv_get(p, "line"))
+pub def pos_char(p: JsonVal) -> int: return jv_int(jv_get(p, "character"))

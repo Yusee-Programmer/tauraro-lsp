@@ -1,0 +1,160 @@
+# document.tr — In-memory document store.
+# Tracks open text documents by URI, storing their content and version.
+
+pub class TextDocument:
+    pub uri:      str
+    pub language: str
+    pub version:  int
+    pub text:     str
+    pub lines:    Vec[str]   # cached line split for quick line lookup
+
+extend TextDocument:
+    pub def init(uri: str, language: str, version: int, text: str) -> TextDocument:
+        mut d = TextDocument()
+        d.uri      = uri
+        d.language = language
+        d.version  = version
+        d.text     = text
+        d.lines    = _split_lines(text)
+        return d
+
+    pub def update(self, version: int, new_text: str):
+        self.version = version
+        self.text    = new_text
+        self.lines   = _split_lines(new_text)
+
+    pub def line_count(self) -> int:
+        return self.lines.len
+
+    pub def get_line(self, n: int) -> str:
+        if n >= 0 and n < self.lines.len:
+            return self.lines.get(n)
+        return ""
+
+    # Get the word under a given (line, character) position.
+    pub def word_at(self, line: int, character: int) -> str:
+        mut l = self.get_line(line)
+        if l.len() == 0: return ""
+        mut n = l.len()
+        if character >= n: return ""
+        # Expand left
+        mut start = character
+        while start > 0 and _is_ident_char(l.char_at(start - 1)):
+            start = start - 1
+        # Expand right
+        mut end = character
+        while end < n and _is_ident_char(l.char_at(end)):
+            end = end + 1
+        if start >= end: return ""
+        return l.slice(start, end)
+
+    # Get the identifier at the start of the word at position
+    pub def offset_of(self, line: int, character: int) -> int:
+        mut total = 0
+        mut i = 0
+        while i < line and i < self.lines.len:
+            total = total + self.lines.get(i).len() + 1  # +1 for newline
+            i = i + 1
+        return total + character
+
+
+pub class DocumentStore:
+    pub docs:     Vec[TextDocument]
+    pub uris:     Vec[str]
+
+extend DocumentStore:
+    pub def init() -> DocumentStore:
+        mut s = DocumentStore()
+        s.docs = Vec[TextDocument].init(16)
+        s.uris = Vec[str].init(16)
+        return s
+
+    pub def open(self, uri: str, language: str, version: int, text: str):
+        mut i = self._find(uri)
+        if i >= 0:
+            self.docs.get(i).update(version, text)
+        else:
+            self.docs.push(TextDocument.init(uri, language, version, text))
+            self.uris.push(uri)
+
+    pub def change(self, uri: str, version: int, new_text: str):
+        mut i = self._find(uri)
+        if i >= 0:
+            self.docs.get(i).update(version, new_text)
+
+    pub def close(self, uri: str):
+        # We keep the document in memory but mark version as -1
+        mut i = self._find(uri)
+        if i >= 0:
+            self.docs.get(i).version = -1
+
+    pub def get(self, uri: str) -> TextDocument:
+        mut i = self._find(uri)
+        if i >= 0: return self.docs.get(i)
+        return TextDocument.init(uri, "tauraro", 0, "")
+
+    pub def has(self, uri: str) -> bool:
+        return self._find(uri) >= 0
+
+    def _find(self, uri: str) -> int:
+        mut i = 0
+        while i < self.uris.len:
+            if self.uris.get(i) == uri: return i
+            i = i + 1
+        return -1
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+pub def uri_to_path(uri: str) -> str:
+    mut s = uri
+    # file:///C:/path  →  C:/path  (Windows)
+    # file:///home/... →  /home/...  (Unix)
+    if s.starts_with("file:///"):
+        s = s.slice(8, s.len())
+        # On Unix, restore leading slash
+        if not s.starts_with("/") and not _has_drive_letter(s):
+            s = "/" + s
+    elif s.starts_with("file://"):
+        s = s.slice(7, s.len())
+    # URL-decode common sequences
+    s = s.replace("%20", " ")
+    s = s.replace("%3A", ":")
+    s = s.replace("%2F", "/")
+    return s
+
+pub def path_to_uri(path: str) -> str:
+    mut s = path.replace("\\", "/")
+    if _has_drive_letter(s):
+        return "file:///" + s
+    if not s.starts_with("/"):
+        s = "/" + s
+    return "file://" + s
+
+def _has_drive_letter(s: str) -> bool:
+    if s.len() < 2: return false
+    mut c = s.char_at(0)
+    mut colon = s.char_at(1)
+    return ((c >= 65 and c <= 90) or (c >= 97 and c <= 122)) and colon == 58
+
+def _split_lines(text: str) -> Vec[str]:
+    mut lines = Vec[str].init(64)
+    mut i = 0
+    mut n = text.len()
+    mut start = 0
+    while i < n:
+        mut c = text.char_at(i)
+        if c == 10:  # '\n'
+            mut line_end = i
+            if line_end > start and text.char_at(line_end - 1) == 13:
+                line_end = line_end - 1  # strip \r
+            lines.push(text.slice(start, line_end))
+            start = i + 1
+        i = i + 1
+    # last line (no trailing newline)
+    if start <= n:
+        lines.push(text.slice(start, n))
+    return lines
+
+def _is_ident_char(c: int) -> bool:
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95
