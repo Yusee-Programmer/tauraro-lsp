@@ -2,6 +2,7 @@
 *.exe
 *.pdb
 *.txt
+*.c
 
 build/
 target/
