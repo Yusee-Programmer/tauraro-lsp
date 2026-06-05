@@ -1,0 +1,11 @@
+# Compiled binaries and debug info
+*.exe
+*.pdb
+*.txt
+
+build/
+target/
+
+**/tauraro_rt.h
+**/tauraro_types.h
+
