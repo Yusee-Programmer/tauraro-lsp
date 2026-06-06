@@ -91,92 +91,16 @@ jobs:
           echo "Runtime dir:    $TAURAROC_RT"
 
       # -------------------------------------------------------
-      # Emit C and normalise the build directory.
-      #
-      # Old tauraroc (≤v0.0.3): emits to src/build/  (next to source)
-      # New tauraroc (≥v0.0.4): emits to ./build/    (CWD-relative)
-      #
-      # We normalise both to ./build/ so the GCC step is consistent.
-      #
-      # Note: tauraro-lsp uses _tr_read_stdin_line / _tr_write_stdout
-      # etc. from tauraro_rt.h — no C shim files needed.
+      # Build directly: v0.0.5 tauraroc finds its own runtime
+      # header and std/ relative to its install dir, and invokes
+      # the C compiler itself. A bare `-o name` places the binary
+      # in the CWD (repo root). No --emit c / manual GCC needed.
       # -------------------------------------------------------
-      - name: Emit C from tauraro-lsp source
+      - name: Build tauraro-lsp
         shell: bash
         run: |
-          "$TAURAROC" src/main.tr --emit c
-
-          # Normalise: old tauraroc emits to src/build/, new to ./build/.
-          if [ ! -f "build/main.c" ] && [ -f "src/build/main.c" ]; then
-            echo "==> Old tauraroc detected — copying src/build/ → build/"
-            mkdir -p build
-            cp -r src/build/. build/
-          fi
-
-          echo "C files in build/:"
-          ls build/*.c build/tauraro_types.h 2>/dev/null | head -20
-
-      - name: Copy runtime header into build dir
-        shell: bash
-        run: |
-          RT="$TAURAROC_RT/tauraro_rt.h"
-          if [ ! -f "$RT" ]; then
-            RT=$(find "$(dirname "$TAURAROC")" -name "tauraro_rt.h" 2>/dev/null | head -1)
-          fi
-          if [ -z "$RT" ] || [ ! -f "$RT" ]; then
-            echo "error: tauraro_rt.h not found (TAURAROC_RT=$TAURAROC_RT)"
-            exit 1
-          fi
-          cp "$RT" build/tauraro_rt.h
-          echo "Copied: $RT -> build/tauraro_rt.h"
-
-      - name: Compile with GCC (Linux / macOS)
-        if: runner.os != 'Windows'
-        run: |
-          set -e
-          gcc -O2 -std=c11 -Wno-misleading-indentation -Ibuild \
-            build/main.c build/module_*.c \
-            build/include/core/alloc.c \
-            build/include/std/core/*.c \
-            build/include/std/io/*.c build/include/std/io.c \
-            build/include/std/string/*.c \
-            -o build/tauraro-lsp -lm
-          echo "Compiled: build/tauraro-lsp"
-
-      - name: Compile with GCC (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -e
-          gcc -O2 -std=c11 -Wno-misleading-indentation -Ibuild \
-            build/main.c build/module_*.c \
-            build/include/core/alloc.c \
-            build/include/std/core/*.c \
-            build/include/std/io/*.c build/include/std/io.c \
-            build/include/std/string/*.c \
-            -o build/tauraro-lsp.exe -lm -lws2_32
-          echo "Compiled: build/tauraro-lsp.exe"
-
-      # -------------------------------------------------------
-      # Move the binary from build/ to the repo root.
-      # Falls back to src/build/ in case an old bootstrap was
-      # used that outputs relative to the source file.
-      # -------------------------------------------------------
-      - name: Place binary at repo root
-        shell: bash
-        run: |
-          if [ -f "build/tauraro-lsp${{ matrix.ext }}" ]; then
-            mv "build/tauraro-lsp${{ matrix.ext }}" "./tauraro-lsp${{ matrix.ext }}"
-          elif [ -f "src/build/tauraro-lsp${{ matrix.ext }}" ]; then
-            echo "==> Fallback: src/build/ → repo root"
-            mv "src/build/tauraro-lsp${{ matrix.ext }}" "./tauraro-lsp${{ matrix.ext }}"
-          elif [ -f "tauraro-lsp${{ matrix.ext }}" ]; then
-            echo "Binary already at repo root."
-          else
-            echo "error: tauraro-lsp${{ matrix.ext }} not found in build/, src/build/, or CWD"
-            ls -la build/ src/build/ 2>/dev/null || true
-            exit 1
-          fi
+          "$TAURAROC" src/main.tr -o "tauraro-lsp${{ matrix.ext }}"
+          echo "Built: tauraro-lsp${{ matrix.ext }}"
 
       - name: Verify binary
         shell: bash
